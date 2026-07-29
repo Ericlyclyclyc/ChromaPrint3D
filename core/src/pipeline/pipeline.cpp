@@ -15,6 +15,7 @@
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <chrono>
 #include <filesystem>
 #include <optional>
 #include <set>
@@ -26,6 +27,13 @@ namespace {
 
 void NotifyProgress(const ProgressCallback& cb, ConvertStage stage, float progress) {
     if (cb) { cb(stage, progress); }
+}
+
+using SteadyClock = std::chrono::steady_clock;
+
+long long ElapsedMs(SteadyClock::time_point since) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(SteadyClock::now() - since)
+        .count();
 }
 
 std::vector<ColorDB> LoadColorDBsFromPaths(const std::vector<std::string>& resolved_paths) {
@@ -110,6 +118,7 @@ void MatchRasterResult::UpgradeColorLayers(int new_color_layers) {
 // ── MatchRaster: stages 1-3 (load → preprocess → match) ─────────────────────
 
 MatchRasterResult MatchRaster(const ConvertRasterRequest& request, ProgressCallback progress) {
+    const auto total_start = SteadyClock::now();
     spdlog::info("MatchRaster started: image={}, dbs={}, model_pack={}",
                  request.image_path.empty() ? "(buffer)" : request.image_path,
                  request.preloaded_dbs.empty() ? request.db_paths.size()
@@ -119,6 +128,7 @@ MatchRasterResult MatchRaster(const ConvertRasterRequest& request, ProgressCallb
                                                    : request.model_pack_path);
 
     // === 1. Load resources ===
+    auto stage_start = SteadyClock::now();
     NotifyProgress(progress, ConvertStage::LoadingResources, 0.0f);
 
     std::vector<std::shared_ptr<const ColorDB>> db_shared;
@@ -165,9 +175,10 @@ MatchRasterResult MatchRaster(const ConvertRasterRequest& request, ProgressCallb
 
     spdlog::info("Model pack: {}", model_pack_ptr ? "loaded" : "none");
     NotifyProgress(progress, ConvertStage::LoadingResources, 1.0f);
-    spdlog::info("Stage: loading_resources completed");
+    spdlog::info("Stage: loading_resources completed, elapsed_ms={}", ElapsedMs(stage_start));
 
     // === 2. Process image ===
+    stage_start = SteadyClock::now();
     NotifyProgress(progress, ConvertStage::Preprocessing, 0.0f);
 
     const float resolved_pixel_mm =
@@ -205,9 +216,11 @@ MatchRasterResult MatchRaster(const ConvertRasterRequest& request, ProgressCallb
     }
 
     NotifyProgress(progress, ConvertStage::Preprocessing, 1.0f);
-    spdlog::info("Stage: preprocessing completed, result={}x{}", img.width, img.height);
+    spdlog::info("Stage: preprocessing completed, result={}x{}, elapsed_ms={}", img.width,
+                 img.height, ElapsedMs(stage_start));
 
     // === 3. Match colors ===
+    stage_start = SteadyClock::now();
     NotifyProgress(progress, ConvertStage::Matching, 0.0f);
 
     MatchConfig match_cfg;
@@ -260,9 +273,9 @@ MatchRasterResult MatchRaster(const ConvertRasterRequest& request, ProgressCallb
 
     NotifyProgress(progress, ConvertStage::Matching, 1.0f);
     spdlog::info("Stage: matching completed, clusters={}, db_only={}, model_fallback={}, "
-                 "avg_db_de={:.2f}, avg_model_de={:.2f}",
+                 "avg_db_de={:.2f}, avg_model_de={:.2f}, elapsed_ms={}",
                  match_stats.clusters_total, match_stats.db_only, match_stats.model_fallback,
-                 match_stats.avg_db_de, match_stats.avg_model_de);
+                 match_stats.avg_db_de, match_stats.avg_model_de, ElapsedMs(stage_start));
 
     // === Populate result ===
     const ResolvedGeometryOptions geometry = ResolveGeometryOptions(request, profile);
@@ -296,14 +309,16 @@ MatchRasterResult MatchRaster(const ConvertRasterRequest& request, ProgressCallb
 
     result.dbs = std::move(db_shared);
 
-    spdlog::info("MatchRaster completed: {}x{}, pixel_mm={:.3f}", result.input_width,
-                 result.input_height, result.resolved_pixel_mm);
+    spdlog::info("MatchRaster completed: {}x{}, pixel_mm={:.3f}, elapsed_ms={}",
+                 result.input_width, result.input_height, result.resolved_pixel_mm,
+                 ElapsedMs(total_start));
     return result;
 }
 
 // ── GenerateRasterModel: stages 4-5 (preview/layer render → 3D export) ───────
 
 ConvertResult GenerateRasterModel(MatchRasterResult& mr, ProgressCallback progress) {
+    const auto total_start = SteadyClock::now();
     spdlog::info("GenerateRasterModel started: {}x{}", mr.input_width, mr.input_height);
 
     ConvertResult result;
@@ -379,7 +394,10 @@ ConvertResult GenerateRasterModel(MatchRasterResult& mr, ProgressCallback progre
                              : layer_preview_error_message);
     }
 
+    spdlog::info("Stage: preview rendering completed, elapsed_ms={}", ElapsedMs(total_start));
+
     // === Build 3D model ===
+    auto stage_start = SteadyClock::now();
     NotifyProgress(progress, ConvertStage::BuildingModel, 0.0f);
 
     const float transparent_mm = mr.transparent_layer_mm;
@@ -411,8 +429,10 @@ ConvertResult GenerateRasterModel(MatchRasterResult& mr, ProgressCallback progre
     { auto tmp = std::move(mr.recipe_map.source_mask); }
 
     NotifyProgress(progress, ConvertStage::BuildingModel, 1.0f);
-    spdlog::info("Stage: building_model completed, grids={}, layers={}", model.voxel_grids.size(),
-                 model.base_layers + model.color_layers);
+    spdlog::info("Stage: building_model completed, grids={}, layers={}, elapsed_ms={}",
+                 model.voxel_grids.size(), model.base_layers + model.color_layers,
+                 ElapsedMs(stage_start));
+    stage_start = SteadyClock::now();
     NotifyProgress(progress, ConvertStage::Exporting, 0.0f);
 
     BuildMeshConfig mesh_cfg;
@@ -512,10 +532,11 @@ ConvertResult GenerateRasterModel(MatchRasterResult& mr, ProgressCallback progre
     result.physical_height_mm = static_cast<float>(mr.input_height) * mr.resolved_pixel_mm;
 
     NotifyProgress(progress, ConvertStage::Exporting, 1.0f);
+    spdlog::info("Stage: exporting completed, elapsed_ms={}", ElapsedMs(stage_start));
     spdlog::info("GenerateRasterModel completed: 3mf={} bytes, preview={} bytes, "
-                 "source_mask={} bytes, physical={:.1f}x{:.1f} mm",
+                 "source_mask={} bytes, physical={:.1f}x{:.1f} mm, elapsed_ms={}",
                  result.model_3mf.size(), result.preview_png.size(), result.source_mask_png.size(),
-                 result.physical_width_mm, result.physical_height_mm);
+                 result.physical_width_mm, result.physical_height_mm, ElapsedMs(total_start));
 
     return result;
 }

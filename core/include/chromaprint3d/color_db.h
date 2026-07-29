@@ -95,11 +95,25 @@ public:
     /// \return Vector of pointers to the k nearest entries (sorted by distance)
     std::vector<const Entry*> NearestEntries(const Lab& target, std::size_t k) const;
 
+    /// Finds the k nearest color entries to the target Lab color, reusing the
+    /// caller-provided buffer (cleared first) to avoid per-call allocations.
+    /// \param target Target Lab color
+    /// \param k Number of nearest entries to find
+    /// \param out Output buffer receiving pointers to the k nearest entries (sorted by distance)
+    void NearestEntries(const Lab& target, std::size_t k, std::vector<const Entry*>& out) const;
+
     /// Finds the k nearest color entries to the target RGB color.
     /// \param target Target RGB color
     /// \param k Number of nearest entries to find
     /// \return Vector of pointers to the k nearest entries (sorted by distance)
     std::vector<const Entry*> NearestEntries(const Rgb& target, std::size_t k) const;
+
+    /// Finds the k nearest color entries to the target RGB color, reusing the
+    /// caller-provided buffer (cleared first) to avoid per-call allocations.
+    /// \param target Target RGB color
+    /// \param k Number of nearest entries to find
+    /// \param out Output buffer receiving pointers to the k nearest entries (sorted by distance)
+    void NearestEntries(const Rgb& target, std::size_t k, std::vector<const Entry*>& out) const;
 
 private:
     struct LabProj {

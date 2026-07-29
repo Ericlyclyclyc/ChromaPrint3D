@@ -386,7 +386,7 @@ int PaletteSlot(std::size_t idx, const std::vector<Channel>& palette, int base_c
 
 } // namespace
 
-// ── BuildMeshes (unchanged) ─────────────────────────────────────────────────
+// ── BuildMeshes ─────────────────────────────────────────────────────────────
 
 std::vector<Mesh> BuildMeshes(const ModelIR& model_ir, const BuildMeshConfig& cfg) {
     if (model_ir.voxel_grids.empty()) { throw InputError("ModelIR voxel_grids is empty"); }
@@ -399,17 +399,16 @@ std::vector<Mesh> BuildMeshes(const ModelIR& model_ir, const BuildMeshConfig& cf
 
     std::vector<Mesh> meshes(static_cast<std::size_t>(n));
 
-#pragma omp parallel for schedule(dynamic)
-    for (int i = 0; i < n; ++i) {
+    auto build_one = [&](int i) {
         const VoxelGrid& grid = model_ir.voxel_grids[static_cast<std::size_t>(i)];
         if (grid.width <= 0 || grid.height <= 0 || grid.num_layers <= 0) {
             spdlog::warn("BuildMeshes: grid {} skipped (dimensions {}x{}x{})", i, grid.width,
                          grid.height, grid.num_layers);
-            continue;
+            return;
         }
         if (grid.ooc.empty()) {
             spdlog::warn("BuildMeshes: grid {} skipped (empty voxel data)", i);
-            continue;
+            return;
         }
 
         BuildMeshConfig per_grid = cfg;
@@ -435,6 +434,19 @@ std::vector<Mesh> BuildMeshes(const ModelIR& model_ir, const BuildMeshConfig& cf
             }
         }
         meshes[static_cast<std::size_t>(i)] = Mesh::Build(grid, per_grid);
+    };
+
+    if (n > 1) {
+        // Multiple grids: parallelize per channel; the nested slice-level
+        // parallelism inside Mesh::Build degrades to serial under MSVC's
+        // OpenMP 2.0 runtime, so the serial vertex welding of all grids runs
+        // concurrently instead of back to back.
+#pragma omp parallel for schedule(dynamic)
+        for (int i = 0; i < n; ++i) { build_one(i); }
+    } else {
+        // Single grid: run serially here so Mesh::Build's internal
+        // (axis, slice) parallelism is not suppressed by an enclosing region.
+        for (int i = 0; i < n; ++i) { build_one(i); }
     }
 
     std::size_t total_verts = 0;

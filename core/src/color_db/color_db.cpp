@@ -202,39 +202,48 @@ const Entry& ColorDB::NearestEntry(const Rgb& target) const {
 }
 
 std::vector<const Entry*> ColorDB::NearestEntries(const Lab& target, std::size_t k) const {
-    if (k == 0) { return {}; }
-    if (entries.empty()) { throw InputError("ColorDB entries is empty"); }
-
-    EnsureKDTree();
-    k = std::min(k, entries.size());
-
-    std::vector<LabTree::NeighborT> neighbors;
-    lab_tree_.KNearest(target, k, neighbors);
-
     std::vector<const Entry*> result;
-    result.reserve(neighbors.size());
-    for (const auto& n : neighbors) {
-        result.push_back(&entries[static_cast<std::size_t>(n.index)]);
-    }
+    NearestEntries(target, k, result);
     return result;
 }
 
-std::vector<const Entry*> ColorDB::NearestEntries(const Rgb& target, std::size_t k) const {
-    if (k == 0) { return {}; }
+void ColorDB::NearestEntries(const Lab& target, std::size_t k,
+                             std::vector<const Entry*>& out) const {
+    out.clear();
+    if (k == 0) { return; }
     if (entries.empty()) { throw InputError("ColorDB entries is empty"); }
 
     EnsureKDTree();
     k = std::min(k, entries.size());
 
-    std::vector<RgbTree::NeighborT> neighbors;
+    // Reused across calls: this runs once per pixel on the matching hot path.
+    thread_local std::vector<LabTree::NeighborT> neighbors;
+    lab_tree_.KNearest(target, k, neighbors);
+
+    out.reserve(neighbors.size());
+    for (const auto& n : neighbors) { out.push_back(&entries[static_cast<std::size_t>(n.index)]); }
+}
+
+std::vector<const Entry*> ColorDB::NearestEntries(const Rgb& target, std::size_t k) const {
+    std::vector<const Entry*> result;
+    NearestEntries(target, k, result);
+    return result;
+}
+
+void ColorDB::NearestEntries(const Rgb& target, std::size_t k,
+                             std::vector<const Entry*>& out) const {
+    out.clear();
+    if (k == 0) { return; }
+    if (entries.empty()) { throw InputError("ColorDB entries is empty"); }
+
+    EnsureKDTree();
+    k = std::min(k, entries.size());
+
+    thread_local std::vector<RgbTree::NeighborT> neighbors;
     rgb_tree_.KNearest(target, k, neighbors);
 
-    std::vector<const Entry*> result;
-    result.reserve(neighbors.size());
-    for (const auto& n : neighbors) {
-        result.push_back(&entries[static_cast<std::size_t>(n.index)]);
-    }
-    return result;
+    out.reserve(neighbors.size());
+    for (const auto& n : neighbors) { out.push_back(&entries[static_cast<std::size_t>(n.index)]); }
 }
 
 void ColorDB::BuildKDTree() const {

@@ -6,9 +6,11 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -404,168 +406,63 @@ Mesh Mesh::Build(const VoxelGrid& voxel_grid, const BuildMeshConfig& cfg) {
         static_cast<size_t>(width) * static_cast<size_t>(height) * static_cast<size_t>(layers);
     if (voxel_grid.ooc.size() < expected) { throw InputError("VoxelGrid ooc size mismatch"); }
 
-    struct Vec3uHash {
-        size_t operator()(const Vec3u& v) const {
-            size_t h = std::hash<uint32_t>{}(v.x);
-            h ^= std::hash<uint32_t>{}(v.y) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            h ^= std::hash<uint32_t>{}(v.z) + 0x9e3779b9 + (h << 6) + (h >> 2);
-            return h;
-        }
-    };
+    // Vertex welding packs grid coordinates into 21 bits per axis.
+    constexpr int kMaxGridDim = (1 << 21) - 1;
+    if (width > kMaxGridDim || height > kMaxGridDim || layers > kMaxGridDim) {
+        throw InputError("VoxelGrid dimension exceeds vertex welding limit");
+    }
 
-    const std::size_t estimated_surface =
-        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 2 +
-        static_cast<std::size_t>(width) * static_cast<std::size_t>(layers) * 2 +
-        static_cast<std::size_t>(height) * static_cast<std::size_t>(layers) * 2;
-    mesh.vertices.reserve(estimated_surface);
-    mesh.indices.reserve(estimated_surface * 2);
-
-    std::unordered_map<Vec3u, uint32_t, Vec3uHash> vertex_map;
-    vertex_map.reserve(estimated_surface);
-    // Integer grid coordinates per vertex, kept for topology post-processing.
-    std::vector<Vec3u> grid_pts;
-    grid_pts.reserve(estimated_surface);
-
-    const float px = cfg.pixel_mm;
-    const float pz = cfg.layer_height_mm;
-
-    auto add_vertex = [&](const Vec3u& v) {
-        auto it = vertex_map.find(v);
-        if (it != vertex_map.end()) { return it->second; }
-        float z = static_cast<float>(v.z) * pz;
-        for (const auto& gap : cfg.interface_offsets) {
-            if (gap.z_index >= 0 && v.z == static_cast<uint32_t>(gap.z_index)) {
-                z += gap.offset_mm;
-                break;
-            }
-        }
-        const uint32_t idx = CheckedU32Index(mesh.vertices.size());
-        mesh.vertices.emplace_back(static_cast<float>(v.x) * px, static_cast<float>(v.y) * px, z);
-        grid_pts.push_back(v);
-        vertex_map.emplace(v, idx);
-        return idx;
-    };
-
-    auto is_filled = [&](int x, int y, int z) -> bool {
-        if (x < 0 || y < 0 || z < 0 || x >= width || y >= height || z >= layers) { return false; }
-        const size_t idx =
-            (static_cast<size_t>(y) * static_cast<size_t>(width) + static_cast<size_t>(x)) *
-                static_cast<size_t>(layers) +
-            static_cast<size_t>(z);
-        return voxel_grid.ooc[idx] != 0;
-    };
-
+    const float px    = cfg.pixel_mm;
+    const float pz    = cfg.layer_height_mm;
     const int dims[3] = {width, height, layers};
+    const uint8_t* ooc = voxel_grid.ooc.data();
 
-    // Emits one merged rectangle [i, i+w) x [j, j+h) in plane axis d at
-    // `slice`, triangulated so that every edge on the rectangle outline is a
-    // unit grid segment. Adjacent faces (coplanar or perpendicular) therefore
-    // always share whole edges at identical vertex indices, which is what
-    // keeps the exported mesh free of T-junction open edges while preserving
-    // the greedy merge (triangle count stays proportional to the perimeter).
-    //
-    // The interior is fanned from per-block centers: the rectangle is cut
-    // along its longer side (in mm) into the fewest blocks that keep every
-    // fan triangle's altitude above ~30 um, each block fanned from an
-    // interior grid point. Block-to-block cuts are single full-length
-    // segments shared by the two adjacent fans, so the triangle count stays
-    // ~2(w + h) + blocks. Fanning the whole outline from one corner instead
-    // would create near-degenerate slivers (altitude ~ unit/perimeter) on
-    // large rectangles, which collapse at slicer precision and stall
-    // slicing.
-    auto emit_rect = [&](int d, int u, int v, int slice, int i, int j, int w, int h,
-                         bool positive) {
-        auto P = [&](int a, int b) {
-            int p[3] = {0, 0, 0};
-            p[d]     = slice;
-            p[u]     = a;
-            p[v]     = b;
-            return Vec3u{CheckedU32Coord(p[0]), CheckedU32Coord(p[1]), CheckedU32Coord(p[2])};
-        };
-        auto tri = [&](const Vec3u& a, const Vec3u& b, const Vec3u& c) {
-            const uint32_t ia = add_vertex(a);
-            uint32_t ib       = add_vertex(b);
-            uint32_t ic       = add_vertex(c);
-            if (!positive) { std::swap(ib, ic); }
-            mesh.indices.emplace_back(ia, ib, ic);
-        };
+    // ── Pass 1: greedy merge per (axis, slice), run in parallel ─────────────
+    // Each task owns one slice of one axis: it builds its own face mask, runs
+    // the greedy rectangle merge and emits triangles as integer grid-coordinate
+    // triples into a private buffer. The shared vertex table is only built in
+    // pass 2, so tasks are fully independent. Tasks are flattened over
+    // (d, slice) so the loop has width+height+layers+3 items — enough
+    // granularity to keep all threads busy even when a single channel (e.g.
+    // the base grid) dominates the volume.
+    const int task_counts[3] = {dims[0] + 1, dims[1] + 1, dims[2] + 1};
+    const int total_tasks    = task_counts[0] + task_counts[1] + task_counts[2];
+    std::vector<std::vector<Vec3u>> task_tris(static_cast<size_t>(total_tasks));
 
-        // Single-row/column strips: the plain unit-step ladder is already
-        // minimal and its right triangles have bounded aspect.
-        if (w == 1 || h == 1) {
-            for (int r = 0; r < h; ++r) {
-                for (int x = 0; x < w; ++x) {
-                    tri(P(i + x, j + r), P(i + x + 1, j + r), P(i + x, j + r + 1));
-                    tri(P(i + x + 1, j + r), P(i + x + 1, j + r + 1), P(i + x, j + r + 1));
-                }
+    std::atomic<bool> has_error{false};
+    std::string error_message;
+
+#ifdef _OPENMP
+#    pragma omp parallel for schedule(dynamic)
+#endif
+    for (int t = 0; t < total_tasks; ++t) {
+        if (has_error.load(std::memory_order_relaxed)) { continue; }
+        try {
+            int d     = 0;
+            int slice = t;
+            while (slice >= task_counts[d]) {
+                slice -= task_counts[d];
+                ++d;
             }
-            return;
-        }
+            const int u = (d + 1) % 3;
+            const int v = (d + 2) % 3;
 
-        // Cut along the longer side (in mm). The worst fan triangle sits on
-        // a long-side unit segment near a block corner: altitude ~=
-        // step_along * across_mm / (block_len_mm * sqrt(2)). Choose the
-        // fewest blocks that keep that above ~30 um.
-        const float step_u     = (u == 2) ? pz : px;
-        const float step_v     = (v == 2) ? pz : px;
-        const bool along_u     = static_cast<float>(w) * step_u >= static_cast<float>(h) * step_v;
-        const int len          = along_u ? w : h;
-        const int across       = along_u ? h : w;
-        const float step_along = along_u ? step_u : step_v;
-        const float len_mm     = static_cast<float>(len) * step_along;
-        const float across_mm  = static_cast<float>(across) * (along_u ? step_v : step_u);
-        constexpr float kMinAltitudeMm = 0.03f * 1.4142135f;
-        const int blocks               = std::clamp(
-            static_cast<int>(std::ceil(len_mm * kMinAltitudeMm / (step_along * across_mm))), 1,
-            std::max(1, len / 2));
+            // All calls below stay in-bounds by construction (see mask fill),
+            // so the per-voxel bounds check is omitted on this hot path.
+            auto is_filled = [&](int x, int y, int z) -> bool {
+                const size_t idx = (static_cast<size_t>(y) * static_cast<size_t>(width) +
+                                    static_cast<size_t>(x)) *
+                                       static_cast<size_t>(layers) +
+                                   static_cast<size_t>(z);
+                return ooc[idx] != 0;
+            };
 
-        auto Q = [&](int al, int ac) { return along_u ? P(i + al, j + ac) : P(i + ac, j + al); };
+            std::vector<Vec3u>& tris = task_tris[static_cast<size_t>(t)];
+            std::vector<int8_t> mask(static_cast<size_t>(dims[u]) * static_cast<size_t>(dims[v]),
+                                     0);
 
-        std::vector<std::pair<int, int>> loop;
-        for (int k = 0; k < blocks; ++k) {
-            const int al0 = static_cast<int>(static_cast<int64_t>(len) * k / blocks);
-            const int al1 = static_cast<int>(static_cast<int64_t>(len) * (k + 1) / blocks);
-
-            // Block boundary, counter-clockwise in (along, across). Outline
-            // sides use unit steps; internal block cuts are single segments
-            // shared verbatim by the neighbouring block's fan.
-            loop.clear();
-            for (int a = al0; a < al1; ++a) { loop.emplace_back(a, 0); }
-            if (al1 == len) {
-                for (int c = 0; c < across; ++c) { loop.emplace_back(al1, c); }
-            } else {
-                loop.emplace_back(al1, 0);
-            }
-            for (int a = al1; a > al0; --a) { loop.emplace_back(a, across); }
-            if (al0 == 0) {
-                for (int c = across; c > 0; --c) { loop.emplace_back(al0, c); }
-            } else {
-                loop.emplace_back(al0, across);
-            }
-
-            const Vec3u apex = Q((al0 + al1) / 2, across / 2);
-            for (size_t s = 0; s < loop.size(); ++s) {
-                const auto& p0 = loop[s];
-                const auto& p1 = loop[(s + 1) % loop.size()];
-                // Swapping the axes mirrors the plane, so restore the winding.
-                if (along_u) {
-                    tri(apex, Q(p0.first, p0.second), Q(p1.first, p1.second));
-                } else {
-                    tri(apex, Q(p1.first, p1.second), Q(p0.first, p0.second));
-                }
-            }
-        }
-    };
-
-    for (int d = 0; d < 3; ++d) {
-        const int u = (d + 1) % 3;
-        const int v = (d + 2) % 3;
-
-        std::vector<int> mask(static_cast<size_t>(dims[u]) * static_cast<size_t>(dims[v]), 0);
-
-        int x[3] = {0, 0, 0};
-        for (int slice = 0; slice <= dims[d]; ++slice) {
-            int n = 0;
+            int x[3] = {0, 0, 0};
+            int n    = 0;
             for (x[v] = 0; x[v] < dims[v]; ++x[v]) {
                 for (x[u] = 0; x[u] < dims[u]; ++x[u]) {
                     bool a = false;
@@ -578,14 +475,126 @@ Mesh Mesh::Build(const VoxelGrid& voxel_grid, const BuildMeshConfig& cfg) {
                         x[d] = slice;
                         b    = is_filled(x[0], x[1], x[2]);
                     }
-                    mask[n++] = (a != b) ? (a ? 1 : -1) : 0;
+                    mask[static_cast<size_t>(n++)] =
+                        (a != b) ? (a ? int8_t{1} : int8_t{-1}) : int8_t{0};
                 }
             }
+
+            // Emits one merged rectangle [i, i+w) x [j, j+h) in plane axis d at
+            // `slice`, triangulated so that every edge on the rectangle outline
+            // is a unit grid segment. Adjacent faces (coplanar or
+            // perpendicular) therefore always share whole edges at identical
+            // vertex indices, which is what keeps the exported mesh free of
+            // T-junction open edges while preserving the greedy merge (triangle
+            // count stays proportional to the perimeter).
+            //
+            // The interior is fanned from per-block centers: the rectangle is
+            // cut along its longer side (in mm) into the fewest blocks that
+            // keep every fan triangle's altitude above ~30 um, each block
+            // fanned from an interior grid point. Block-to-block cuts are
+            // single full-length segments shared by the two adjacent fans, so
+            // the triangle count stays ~2(w + h) + blocks. Fanning the whole
+            // outline from one corner instead would create near-degenerate
+            // slivers (altitude ~ unit/perimeter) on large rectangles, which
+            // collapse at slicer precision and stall slicing.
+            auto emit_rect = [&](int i, int j, int w, int h, bool positive) {
+                auto P = [&](int a, int b) {
+                    int p[3] = {0, 0, 0};
+                    p[d]     = slice;
+                    p[u]     = a;
+                    p[v]     = b;
+                    return Vec3u{CheckedU32Coord(p[0]), CheckedU32Coord(p[1]),
+                                 CheckedU32Coord(p[2])};
+                };
+                auto tri = [&](const Vec3u& a, const Vec3u& b, const Vec3u& c) {
+                    tris.push_back(a);
+                    if (positive) {
+                        tris.push_back(b);
+                        tris.push_back(c);
+                    } else {
+                        tris.push_back(c);
+                        tris.push_back(b);
+                    }
+                };
+
+                // Single-row/column strips: the plain unit-step ladder is
+                // already minimal and its right triangles have bounded aspect.
+                if (w == 1 || h == 1) {
+                    for (int r = 0; r < h; ++r) {
+                        for (int s = 0; s < w; ++s) {
+                            tri(P(i + s, j + r), P(i + s + 1, j + r), P(i + s, j + r + 1));
+                            tri(P(i + s + 1, j + r), P(i + s + 1, j + r + 1),
+                                P(i + s, j + r + 1));
+                        }
+                    }
+                    return;
+                }
+
+                // Cut along the longer side (in mm). The worst fan triangle
+                // sits on a long-side unit segment near a block corner:
+                // altitude ~= step_along * across_mm / (block_len_mm *
+                // sqrt(2)). Choose the fewest blocks that keep that above
+                // ~30 um.
+                const float step_u = (u == 2) ? pz : px;
+                const float step_v = (v == 2) ? pz : px;
+                const bool along_u =
+                    static_cast<float>(w) * step_u >= static_cast<float>(h) * step_v;
+                const int len          = along_u ? w : h;
+                const int across       = along_u ? h : w;
+                const float step_along = along_u ? step_u : step_v;
+                const float len_mm     = static_cast<float>(len) * step_along;
+                const float across_mm  = static_cast<float>(across) * (along_u ? step_v : step_u);
+                constexpr float kMinAltitudeMm = 0.03f * 1.4142135f;
+                const int blocks               = std::clamp(
+                    static_cast<int>(std::ceil(len_mm * kMinAltitudeMm / (step_along * across_mm))),
+                    1, std::max(1, len / 2));
+
+                auto Q = [&](int al, int ac) {
+                    return along_u ? P(i + al, j + ac) : P(i + ac, j + al);
+                };
+
+                std::vector<std::pair<int, int>> loop;
+                for (int k = 0; k < blocks; ++k) {
+                    const int al0 = static_cast<int>(static_cast<int64_t>(len) * k / blocks);
+                    const int al1 = static_cast<int>(static_cast<int64_t>(len) * (k + 1) / blocks);
+
+                    // Block boundary, counter-clockwise in (along, across).
+                    // Outline sides use unit steps; internal block cuts are
+                    // single segments shared verbatim by the neighbouring
+                    // block's fan.
+                    loop.clear();
+                    for (int a = al0; a < al1; ++a) { loop.emplace_back(a, 0); }
+                    if (al1 == len) {
+                        for (int c = 0; c < across; ++c) { loop.emplace_back(al1, c); }
+                    } else {
+                        loop.emplace_back(al1, 0);
+                    }
+                    for (int a = al1; a > al0; --a) { loop.emplace_back(a, across); }
+                    if (al0 == 0) {
+                        for (int c = across; c > 0; --c) { loop.emplace_back(al0, c); }
+                    } else {
+                        loop.emplace_back(al0, across);
+                    }
+
+                    const Vec3u apex = Q((al0 + al1) / 2, across / 2);
+                    for (size_t s = 0; s < loop.size(); ++s) {
+                        const auto& p0 = loop[s];
+                        const auto& p1 = loop[(s + 1) % loop.size()];
+                        // Swapping the axes mirrors the plane, so restore the
+                        // winding.
+                        if (along_u) {
+                            tri(apex, Q(p0.first, p0.second), Q(p1.first, p1.second));
+                        } else {
+                            tri(apex, Q(p1.first, p1.second), Q(p0.first, p0.second));
+                        }
+                    }
+                }
+            };
 
             n = 0;
             for (int j = 0; j < dims[v]; ++j) {
                 for (int i = 0; i < dims[u];) {
-                    const int c = mask[n];
+                    const int c = mask[static_cast<size_t>(n)];
                     if (c == 0) {
                         ++i;
                         ++n;
@@ -593,13 +602,13 @@ Mesh Mesh::Build(const VoxelGrid& voxel_grid, const BuildMeshConfig& cfg) {
                     }
 
                     int w = 1;
-                    while (i + w < dims[u] && mask[n + w] == c) { ++w; }
+                    while (i + w < dims[u] && mask[static_cast<size_t>(n + w)] == c) { ++w; }
 
                     int h = 1;
                     for (; j + h < dims[v]; ++h) {
                         bool ok = true;
                         for (int k = 0; k < w; ++k) {
-                            if (mask[n + k + h * dims[u]] != c) {
+                            if (mask[static_cast<size_t>(n + k + h * dims[u])] != c) {
                                 ok = false;
                                 break;
                             }
@@ -607,17 +616,105 @@ Mesh Mesh::Build(const VoxelGrid& voxel_grid, const BuildMeshConfig& cfg) {
                         if (!ok) { break; }
                     }
 
-                    emit_rect(d, u, v, slice, i, j, w, h, c > 0);
+                    emit_rect(i, j, w, h, c > 0);
 
                     for (int dy = 0; dy < h; ++dy) {
-                        for (int dx = 0; dx < w; ++dx) { mask[n + dx + dy * dims[u]] = 0; }
+                        for (int dx = 0; dx < w; ++dx) {
+                            mask[static_cast<size_t>(n + dx + dy * dims[u])] = 0;
+                        }
                     }
 
                     i += w;
                     n += w;
                 }
             }
+        } catch (const std::exception& e) {
+#ifdef _OPENMP
+#    pragma omp critical(mesh_build_slice_error)
+#endif
+            {
+                if (!has_error.load(std::memory_order_relaxed)) {
+                    error_message = e.what();
+                    has_error.store(true, std::memory_order_relaxed);
+                }
+            }
+        } catch (...) {
+#ifdef _OPENMP
+#    pragma omp critical(mesh_build_slice_error)
+#endif
+            {
+                if (!has_error.load(std::memory_order_relaxed)) {
+                    error_message = "Unknown error in greedy mesh slice extraction";
+                    has_error.store(true, std::memory_order_relaxed);
+                }
+            }
         }
+    }
+
+    if (has_error.load(std::memory_order_relaxed)) {
+        throw InputError(error_message.empty() ? "Greedy mesh slice extraction failed"
+                                               : error_message);
+    }
+
+    // ── Pass 2: serial vertex welding in deterministic (axis, slice) order ──
+    // Iterating the task buffers in flattened order reproduces the exact
+    // triangle and first-use vertex order of the previous single-threaded
+    // implementation, so the output mesh is bit-identical.
+    const std::size_t estimated_surface =
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 2 +
+        static_cast<std::size_t>(width) * static_cast<std::size_t>(layers) * 2 +
+        static_cast<std::size_t>(height) * static_cast<std::size_t>(layers) * 2;
+    std::size_t total_tri_count = 0;
+    for (const auto& tris : task_tris) { total_tri_count += tris.size() / 3; }
+
+    mesh.vertices.reserve(estimated_surface);
+    mesh.indices.reserve(total_tri_count);
+    // Integer grid coordinates per vertex, kept for topology post-processing.
+    std::vector<Vec3u> grid_pts;
+    grid_pts.reserve(estimated_surface);
+
+    // splitmix64 finalizer over the packed 21-bit-per-axis key: much stronger
+    // mixing than the previous per-component xor hash, which clustered badly
+    // on regular grid coordinates.
+    struct PackedVertexHash {
+        size_t operator()(uint64_t key) const {
+            key += 0x9e3779b97f4a7c15ull;
+            key = (key ^ (key >> 30)) * 0xbf58476d1ce4e5b9ull;
+            key = (key ^ (key >> 27)) * 0x94d049bb133111ebull;
+            return static_cast<size_t>(key ^ (key >> 31));
+        }
+    };
+    std::unordered_map<uint64_t, uint32_t, PackedVertexHash> vertex_map;
+    vertex_map.reserve(estimated_surface);
+
+    auto add_vertex = [&](const Vec3u& v) {
+        const uint64_t key = (static_cast<uint64_t>(v.x) << 42) |
+                             (static_cast<uint64_t>(v.y) << 21) | static_cast<uint64_t>(v.z);
+        auto it = vertex_map.find(key);
+        if (it != vertex_map.end()) { return it->second; }
+        float z = static_cast<float>(v.z) * pz;
+        for (const auto& gap : cfg.interface_offsets) {
+            if (gap.z_index >= 0 && v.z == static_cast<uint32_t>(gap.z_index)) {
+                z += gap.offset_mm;
+                break;
+            }
+        }
+        const uint32_t idx = CheckedU32Index(mesh.vertices.size());
+        mesh.vertices.emplace_back(static_cast<float>(v.x) * px, static_cast<float>(v.y) * px, z);
+        grid_pts.push_back(v);
+        vertex_map.emplace(key, idx);
+        return idx;
+    };
+
+    for (auto& tris : task_tris) {
+        for (std::size_t k = 0; k + 2 < tris.size(); k += 3) {
+            const uint32_t ia = add_vertex(tris[k]);
+            const uint32_t ib = add_vertex(tris[k + 1]);
+            const uint32_t ic = add_vertex(tris[k + 2]);
+            mesh.indices.emplace_back(ia, ib, ic);
+        }
+        // Free each buffer as soon as it is welded to cap peak memory.
+        std::vector<Vec3u>{}.swap(tris);
     }
 
     SplitNonManifoldContacts(mesh, grid_pts, 0.125f * std::min(px, pz));

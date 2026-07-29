@@ -39,6 +39,11 @@ CandidateResult FindBestDbCandidate(const T& target_color,
     const bool use_top_k = cfg.k_candidates > 1;
     const Lab target_lab = AsLab(target_color);
 
+    // Reused across DBs and candidates: this function runs once per pixel, so
+    // per-candidate vector construction would dominate the hot path.
+    std::vector<uint8_t> mapped_recipe;
+    std::vector<const Entry*> candidates;
+
     for (const PreparedDB& prepared_db : prepared_dbs) {
         const ColorDB* search_db =
             prepared_db.filtered_db ? prepared_db.filtered_db.get() : prepared_db.db;
@@ -46,14 +51,13 @@ CandidateResult FindBestDbCandidate(const T& target_color,
 
         if (!use_top_k) {
             const Entry& entry = search_db->NearestEntry(target_color);
-            std::vector<uint8_t> mapped_recipe;
             if (!ConvertRecipeToProfile(entry, prepared_db, profile, mapped_recipe)) { continue; }
 
             const float score_d2 = ScoreDist2(entry.lab, target_color);
             if (!best.valid || score_d2 < best.score_dist2) {
-                best.valid       = true;
-                best.mapped_lab  = entry.lab;
-                best.recipe      = std::move(mapped_recipe);
+                best.valid      = true;
+                best.mapped_lab = entry.lab;
+                std::swap(best.recipe, mapped_recipe);
                 best.score_dist2 = score_d2;
                 best.lab_dist2   = Dist2(entry.lab, target_lab);
                 best.from_model  = false;
@@ -61,16 +65,15 @@ CandidateResult FindBestDbCandidate(const T& target_color,
             continue;
         }
 
-        auto candidates = search_db->NearestEntries(target_color, k);
+        search_db->NearestEntries(target_color, k, candidates);
         for (const Entry* entry : candidates) {
             if (!entry) { continue; }
-            std::vector<uint8_t> mapped_recipe;
             if (!ConvertRecipeToProfile(*entry, prepared_db, profile, mapped_recipe)) { continue; }
             const float score_d2 = ScoreDist2(entry->lab, target_color);
             if (!best.valid || score_d2 < best.score_dist2) {
-                best.valid       = true;
-                best.mapped_lab  = entry->lab;
-                best.recipe      = std::move(mapped_recipe);
+                best.valid      = true;
+                best.mapped_lab = entry->lab;
+                std::swap(best.recipe, mapped_recipe);
                 best.score_dist2 = score_d2;
                 best.lab_dist2   = Dist2(entry->lab, target_lab);
                 best.from_model  = false;

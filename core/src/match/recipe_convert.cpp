@@ -25,7 +25,10 @@ bool ConvertRecipeToProfile(const Entry& entry, const PreparedDB& prepared_db,
     if (entry.recipe.empty()) { return false; }
     const ColorDB& db = *prepared_db.db;
 
-    std::vector<int> ordered_recipe(entry.recipe.begin(), entry.recipe.end());
+    // Scratch buffers reused across calls: this runs per candidate on the
+    // per-pixel matching hot path, where fresh vectors would dominate cost.
+    thread_local std::vector<int> ordered_recipe;
+    ordered_recipe.assign(entry.recipe.begin(), entry.recipe.end());
     if (db.layer_order != profile.layer_order) {
         std::reverse(ordered_recipe.begin(), ordered_recipe.end());
     }
@@ -46,13 +49,16 @@ bool ConvertRecipeToProfile(const Entry& entry, const PreparedDB& prepared_db,
         }
     };
 
-    std::vector<int> profile_layers_recipe;
+    thread_local std::vector<int> profile_layers_recipe;
+    profile_layers_recipe.clear();
     profile_layers_recipe.reserve(static_cast<std::size_t>(profile.color_layers));
 
     if (NearlyEqual(db.layer_height_mm, profile.layer_height_mm)) {
         const int src_layers = static_cast<int>(ordered_recipe.size());
         if (src_layers > profile.color_layers) { return false; }
-        profile_layers_recipe = std::move(ordered_recipe);
+        // Swap instead of move so both thread_local buffers keep their
+        // capacity for the next call.
+        std::swap(profile_layers_recipe, ordered_recipe);
         PadToTarget(profile_layers_recipe, profile.color_layers);
     } else if (db.layer_height_mm > profile.layer_height_mm) {
         const float ratio_f = db.layer_height_mm / profile.layer_height_mm;

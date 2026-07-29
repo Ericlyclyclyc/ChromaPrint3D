@@ -18,6 +18,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <optional>
 #include <string>
@@ -46,8 +47,10 @@ int EstimateClusterCount(const cv::Mat& samples) {
         for (int i = 0; i < samples.rows; ++i) indices.at<int>(i) = i;
         cv::randShuffle(indices);
         sub = cv::Mat(kMaxSubsamples, samples.cols, samples.type());
+        CV_Assert(samples.type() == CV_32FC1 && samples.cols == 3);
         for (int i = 0; i < kMaxSubsamples; ++i) {
-            samples.row(indices.at<int>(i)).copyTo(sub.row(i));
+            std::memcpy(sub.ptr<float>(i), samples.ptr<float>(indices.at<int>(i)),
+                        3 * sizeof(float));
         }
     }
     const int n = sub.rows;
@@ -468,12 +471,15 @@ RecipeMap MatchFromRasterCore(const RasterProcResult& img,
     // Build sample matrix (needed for both auto-K detection and actual clustering)
     const cv::Mat target_flat = target.reshape(1, static_cast<int>(pixel_count));
     cv::Mat samples(num_valid, 3, CV_32FC1);
+    CV_Assert(target_flat.type() == CV_32FC1 && target_flat.cols == 3);
 #ifdef _OPENMP
 #    pragma omp parallel for schedule(static)
 #endif
     for (int i = 0; i < num_valid; ++i) {
-        target_flat.row(static_cast<int>(valid_indices[static_cast<std::size_t>(i)]))
-            .copyTo(samples.row(i));
+        std::memcpy(
+            samples.ptr<float>(i),
+            target_flat.ptr<float>(static_cast<int>(valid_indices[static_cast<std::size_t>(i)])),
+            3 * sizeof(float));
     }
 
     const int resolved_k =
@@ -501,7 +507,8 @@ RecipeMap MatchFromRasterCore(const RasterProcResult& img,
         cv::randShuffle(sub_indices);
         cv::Mat sub_samples(kMaxClusterSubsamples, 3, CV_32FC1);
         for (int i = 0; i < kMaxClusterSubsamples; ++i) {
-            samples.row(sub_indices.at<int>(i)).copyTo(sub_samples.row(i));
+            std::memcpy(sub_samples.ptr<float>(i), samples.ptr<float>(sub_indices.at<int>(i)),
+                        3 * sizeof(float));
         }
         cv::Mat sub_labels;
         cv::kmeans(sub_samples, resolved_k, sub_labels, criteria, 3, cv::KMEANS_PP_CENTERS,
