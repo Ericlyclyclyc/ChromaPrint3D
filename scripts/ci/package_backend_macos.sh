@@ -11,6 +11,7 @@ export OPENCV_PREFIX="$(brew --prefix opencv)"
 export LIBOMP_PREFIX="$(brew --prefix libomp)"
 export JPEG_PREFIX="$(brew --prefix jpeg-turbo)"
 export OPENBLAS_PREFIX="$(brew --prefix openblas 2>/dev/null || true)"
+export GCC_PREFIX="$(brew --prefix gcc 2>/dev/null || true)"
 
 if [[ -n "${OPENBLAS_PREFIX}" && -d "${OPENBLAS_PREFIX}/lib" ]]; then
   find "${OPENBLAS_PREFIX}/lib" -name "libopenblas*.dylib*" \
@@ -32,7 +33,7 @@ queue = [pkg / "chromaprint3d_server"] + initial_dylibs
 seen = set()
 
 search_dirs = []
-for key in ("BREW_PREFIX", "OPENCV_PREFIX", "LIBOMP_PREFIX", "JPEG_PREFIX", "OPENBLAS_PREFIX"):
+for key in ("BREW_PREFIX", "OPENCV_PREFIX", "LIBOMP_PREFIX", "JPEG_PREFIX", "OPENBLAS_PREFIX", "GCC_PREFIX"):
     value = os.environ.get(key)
     if value:
         search_dirs.append(Path(value) / "lib")
@@ -41,20 +42,38 @@ search_dirs.extend([Path("/usr/local/lib"), Path("/opt/homebrew/lib")])
 search_dirs = [p for p in search_dirs if p.exists()]
 
 
+def locate_by_basename(base: str, extra_dirs=()):
+    """Locate a dylib by file name: bundle-local dirs, known lib dirs, then
+    the Homebrew gcc keg tree (gcc runtime libs such as libgcc_s.1.1.dylib
+    are referenced by relative install names that stop resolving after
+    relocation, and are not symlinked into the opt lib dir)."""
+    for directory in extra_dirs:
+        candidate = (Path(directory) / base).resolve()
+        if candidate.exists():
+            return candidate
+    for directory in search_dirs:
+        candidate = (Path(directory) / base).resolve()
+        if candidate.exists():
+            return candidate
+    gcc_lib = os.environ.get("GCC_PREFIX")
+    if gcc_lib:
+        gcc_tree = Path(gcc_lib) / "lib" / "gcc"
+        if gcc_tree.exists():
+            hits = sorted(gcc_tree.rglob(base))
+            if hits:
+                return hits[0]
+    return None
+
+
 def resolve_dep(dep: str, owner: Path):
     if dep.startswith("@loader_path/"):
         candidate = (owner.parent / dep[len("@loader_path/"):]).resolve()
-        return candidate if candidate.exists() else None
+        return candidate if candidate.exists() else locate_by_basename(os.path.basename(dep))
     if dep.startswith("@executable_path/"):
         candidate = (pkg / dep[len("@executable_path/"):]).resolve()
         return candidate if candidate.exists() else None
     if dep.startswith("@rpath/"):
-        base = os.path.basename(dep)
-        for directory in [owner.parent, *search_dirs]:
-            candidate = (Path(directory) / base).resolve()
-            if candidate.exists():
-                return candidate
-        return None
+        return locate_by_basename(os.path.basename(dep), extra_dirs=[owner.parent])
     candidate = Path(dep)
     return candidate.resolve() if candidate.exists() else None
 
