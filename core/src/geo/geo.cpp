@@ -44,9 +44,9 @@ inline uint64_t UndirectedEdgeKey(uint32_t a, uint32_t b) {
 // paired by this cell so each solid keeps its own topological shell.
 std::array<int, 3> OwnerCellAtEdge(const Vec3u& tri, const std::vector<Vec3u>& grid_pts,
                                    uint32_t va, uint32_t vb) {
-    const Vec3u& g0 = grid_pts[tri.x];
-    const Vec3u& g1 = grid_pts[tri.y];
-    const Vec3u& g2 = grid_pts[tri.z];
+    const Vec3u& g0   = grid_pts[tri.x];
+    const Vec3u& g1   = grid_pts[tri.y];
+    const Vec3u& g2   = grid_pts[tri.z];
     const int P[3][3] = {
         {static_cast<int>(g0.x), static_cast<int>(g0.y), static_cast<int>(g0.z)},
         {static_cast<int>(g1.x), static_cast<int>(g1.y), static_cast<int>(g1.z)},
@@ -124,6 +124,7 @@ void SplitNonManifoldContacts(Mesh& mesh, const std::vector<Vec3u>& grid_pts, fl
         uint32_t tri;
         std::array<int, 3> owner;
     };
+
     std::unordered_map<uint64_t, std::vector<NmFace>> nm_faces;
     nm_faces.reserve(nm_edges.size());
     for (uint32_t ti = 0; ti < mesh.indices.size(); ++ti) {
@@ -200,8 +201,7 @@ void SplitNonManifoldContacts(Mesh& mesh, const std::vector<Vec3u>& grid_pts, fl
                 const uint32_t ti = faces[fi].tri;
                 Vec3u t           = mesh.indices[ti];
                 int rot           = 0;
-                while (rot < 3 &&
-                       !((t.x == va && t.y == vb) || (t.x == vb && t.y == va))) {
+                while (rot < 3 && !((t.x == va && t.y == vb) || (t.x == vb && t.y == va))) {
                     t = Vec3u{t.y, t.z, t.x};
                     ++rot;
                 }
